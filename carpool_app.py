@@ -9,7 +9,6 @@ Run with:
 """
 
 import math
-
 import folium
 import pandas as pd
 import requests
@@ -17,36 +16,35 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 
-# ---------- Page setup ----------
-st.set_page_config(page_title="Church Carpool Optimizer", page_icon="⛪", layout="wide")
-
-
-# ---------- Session state initialization ----------
+# =========================================================
+# Session State Initialization
+# =========================================================
 def init_session_state():
-    """Initialize all session state keys used by the app."""
     defaults = {
         "ors_api_key": "",
         "church_address": "",
         "people": [],
         "geocode_cache": {},
         "carpool_results": None,
-        "warnings": [],
-        "last_error": None,
-        "last_suggestion_error": None,
         "person_counter": 0,
         "new_person_name": "",
         "new_person_has_car": False,
         "new_person_capacity": 3,
         "new_person_address": "",
+        "last_suggestion_error": None,
+        "_church_address": "",
+        "_new_person_address": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-# ---------- Utility functions ----------
+# =========================================================
+# Distance Utility
+# =========================================================
 def haversine_miles(coord1, coord2):
-    """Return the great-circle distance between two (lat, lon) points in miles."""
+    """Return great-circle distance between two (lat, lon) coordinates in miles."""
     lat1, lon1 = coord1
     lat2, lon2 = coord2
 
@@ -65,9 +63,12 @@ def haversine_miles(coord1, coord2):
     return radius_miles * c
 
 
+# =========================================================
+# ORS API Calls
+# =========================================================
 @st.cache_data(show_spinner=False)
 def geocode_address_request(address, api_key):
-    """Call the ORS geocoding API once and return (lat, lon) for the best match."""
+    """Call ORS geocoding API and return (lat, lon) for the best result."""
     url = "https://api.openrouteservice.org/geocode/search"
     params = {
         "api_key": api_key,
@@ -83,14 +84,14 @@ def geocode_address_request(address, api_key):
     if not features:
         raise ValueError(f"No geocoding result found for: {address}")
 
-    coordinates = features[0]["geometry"]["coordinates"]
-    lon, lat = coordinates[0], coordinates[1]
+    coords = features[0]["geometry"]["coordinates"]
+    lon, lat = coords[0], coords[1]
     return (lat, lon)
 
 
 @st.cache_data(show_spinner=False)
 def autocomplete_address_request(query, api_key):
-    """Call the ORS autocomplete geocoder and return a short list of suggestions."""
+    """Call ORS autocomplete API and return a list of suggestion dicts."""
     url = "https://api.openrouteservice.org/geocode/autocomplete"
     params = {
         "api_key": api_key,
@@ -123,39 +124,36 @@ def autocomplete_address_request(query, api_key):
 
 
 def geocode_address(address, api_key):
-    """Geocode an address with a session-state cache so reruns do not repeat the request."""
+    """Geocode an address with session-state caching."""
     normalized = address.strip()
     if not normalized:
         raise ValueError("Address is empty.")
 
-    cache = st.session_state.geocode_cache
-    if normalized in cache:
-        return cache[normalized]
+    if normalized in st.session_state.geocode_cache:
+        return st.session_state.geocode_cache[normalized]
 
     coords = geocode_address_request(normalized, api_key)
-    cache[normalized] = coords
-    st.session_state.geocode_cache = cache
+    st.session_state.geocode_cache[normalized] = coords
     return coords
 
 
 def get_address_suggestions(query, api_key):
-    """Fetch autocomplete suggestions and warm the geocode cache for selected labels."""
+    """Fetch autocomplete suggestions and warm cache with returned coordinates."""
     normalized = query.strip()
-    if len(normalized) < 3 or not api_key:
+    if len(normalized) < 1 or not api_key:
         return []
 
     suggestions = autocomplete_address_request(normalized, api_key)
 
-    cache = st.session_state.geocode_cache
     for suggestion in suggestions:
-        if suggestion["coords"] and suggestion["label"] not in cache:
-            cache[suggestion["label"]] = suggestion["coords"]
-    st.session_state.geocode_cache = cache
+        if suggestion["coords"] and suggestion["label"] not in st.session_state.geocode_cache:
+            st.session_state.geocode_cache[suggestion["label"]] = suggestion["coords"]
+
     return suggestions
 
 
 def geocode_all_addresses(church_address, people, api_key):
-    """Geocode the church and all people. Returns a tuple of (church_coords, enriched_people)."""
+    """Geocode church and all people addresses."""
     church_coords = geocode_address(church_address, api_key)
 
     enriched_people = []
@@ -168,41 +166,61 @@ def geocode_all_addresses(church_address, people, api_key):
     return church_coords, enriched_people
 
 
-def build_people_table(people):
-    """Create a dataframe for the running list of people."""
-    if not people:
-        return pd.DataFrame(columns=["Name", "Address", "Role", "Capacity"])
-
-    rows = []
-    for person in people:
-        rows.append(
-            {
-                "Name": person["name"],
-                "Address": person["address"],
-                "Role": "🚗 Driver" if person["has_car"] else "🧍 Passenger",
-                "Capacity": person["capacity"] if person["has_car"] else 0,
-            }
-        )
-    return pd.DataFrame(rows)
+# =========================================================
+# Safe Widget State Helpers
+# =========================================================
+def sync_temp_to_perm(temp_key, perm_key):
+    """Copy temporary widget value into permanent session-state key."""
+    st.session_state[perm_key] = st.session_state.get(temp_key, "")
 
 
-def render_address_autocomplete(label, key_name, api_key, placeholder, icon=None, help_text=None):
-    """Render a text box plus clickable ORS address suggestions beneath it."""
-    current_value = st.text_input(
+def load_perm_to_temp(perm_key, temp_key):
+    """Load permanent session-state value into widget temp key."""
+    st.session_state[temp_key] = st.session_state.get(perm_key, "")
+
+
+def choose_suggestion(perm_key, temp_key, label):
+    """Safely select a suggestion without mutating the active widget key incorrectly."""
+    st.session_state[perm_key] = label
+    st.session_state[temp_key] = label
+
+
+# =========================================================
+# Address Autocomplete UI
+# =========================================================
+def render_address_autocomplete(label, key_name, api_key, placeholder, help_text=None):
+    """
+    Render a text input plus clickable ORS suggestions.
+
+    Uses:
+      - permanent key: key_name
+      - widget temp key: f"_{key_name}"
+
+    This avoids the StreamlitAPIException caused by writing to the same
+    widget session-state key after the widget is instantiated.
+    """
+    temp_key = f"_{key_name}"
+
+    if temp_key not in st.session_state:
+        load_perm_to_temp(key_name, temp_key)
+
+    st.text_input(
         label,
-        key=key_name,
+        key=temp_key,
         placeholder=placeholder,
         help=help_text,
-        icon=icon,
+        on_change=sync_temp_to_perm,
+        args=(temp_key, key_name),
     )
 
-    query = current_value.strip()
+    query = st.session_state.get(temp_key, "").strip()
+
     if not api_key:
         st.caption("Add your ORS API key in the sidebar to enable address suggestions.")
         return query
 
-    if len(query) < 3:
-        st.caption("Start typing at least 3 characters to see address suggestions.")
+    if len(query) < 1:
+        st.caption("Start typing to see address suggestions.")
         return query
 
     try:
@@ -225,20 +243,24 @@ def render_address_autocomplete(label, key_name, api_key, placeholder, icon=None
 
     st.caption("Suggested matches:")
     for idx, suggestion in enumerate(suggestions, start=1):
-        button_key = f"{key_name}_suggestion_{idx}"
-        if st.button(f"{idx}. {suggestion['label']}", key=button_key, use_container_width=True):
-            st.session_state[key_name] = suggestion["label"]
-            st.rerun()
+        st.button(
+            f"{idx}. {suggestion['label']}",
+            key=f"{key_name}_suggestion_{idx}",
+            use_container_width=True,
+            on_click=choose_suggestion,
+            args=(key_name, temp_key, suggestion["label"]),
+        )
 
     return st.session_state.get(key_name, query).strip()
 
 
-# ---------- Optimization functions ----------
+# =========================================================
+# Carpool Optimization
+# =========================================================
 def assign_passengers_to_drivers(drivers, passengers):
     """
     Phase 1:
     Greedily assign each passenger to the nearest driver with remaining capacity.
-    Returns (car_groups, unassigned_passengers).
     """
     car_groups = []
     for driver in drivers:
@@ -252,7 +274,6 @@ def assign_passengers_to_drivers(drivers, passengers):
 
     unassigned = passengers.copy()
 
-    # Repeatedly select the globally closest passenger-driver pair where capacity remains.
     while unassigned:
         best_pair = None
 
@@ -260,6 +281,7 @@ def assign_passengers_to_drivers(drivers, passengers):
             for group in car_groups:
                 if group["remaining_capacity"] <= 0:
                     continue
+
                 distance = haversine_miles(passenger["coords"], group["driver"]["coords"])
                 if best_pair is None or distance < best_pair[0]:
                     best_pair = (distance, passenger, group)
@@ -278,8 +300,8 @@ def assign_passengers_to_drivers(drivers, passengers):
 def order_pickups_for_group(driver, passengers, church_coords):
     """
     Phase 2:
-    Use nearest-neighbor route ordering from driver home through passengers, ending at church.
-    Returns (ordered_passengers, total_distance_miles, route_points).
+    Order pickups using nearest-neighbor route ordering.
+    Start at driver home, visit closest passenger repeatedly, end at church.
     """
     remaining = passengers.copy()
     ordered = []
@@ -292,14 +314,12 @@ def order_pickups_for_group(driver, passengers, church_coords):
             remaining,
             key=lambda p: haversine_miles(current, p["coords"]),
         )
-        leg_distance = haversine_miles(current, next_passenger["coords"])
-        total_distance += leg_distance
+        total_distance += haversine_miles(current, next_passenger["coords"])
         ordered.append(next_passenger)
         route_points.append(next_passenger["coords"])
         current = next_passenger["coords"]
         remaining = [p for p in remaining if p["id"] != next_passenger["id"]]
 
-    # End the route at the church.
     total_distance += haversine_miles(current, church_coords)
     route_points.append(church_coords)
 
@@ -307,7 +327,7 @@ def order_pickups_for_group(driver, passengers, church_coords):
 
 
 def optimize_carpools(church_coords, people):
-    """Run the two-phase greedy carpool optimizer."""
+    """Run the full two-phase greedy optimization."""
     drivers = [p for p in people if p["has_car"]]
     passengers = [p for p in people if not p["has_car"]]
 
@@ -319,7 +339,6 @@ def optimize_carpools(church_coords, people):
                 "cars_used": 0,
                 "total_distance": 0.0,
                 "people_transported": 0,
-                "total_people": len(people),
             },
         }
 
@@ -339,8 +358,6 @@ def optimize_carpools(church_coords, people):
 
         used_seats = len(ordered_passengers)
         total_distance += route_distance
-
-        # A car is counted as used if the driver is making the trip.
         people_transported += 1 + used_seats
 
         cars.append(
@@ -354,28 +371,26 @@ def optimize_carpools(church_coords, people):
             }
         )
 
-    cars_used = len(cars)
-
     return {
         "cars": cars,
         "unassigned": unassigned,
         "stats": {
-            "cars_used": cars_used,
+            "cars_used": len(cars),
             "total_distance": total_distance,
             "people_transported": people_transported,
-            "total_people": len(people),
         },
     }
 
 
+# =========================================================
+# CSV Export
+# =========================================================
 def export_results_csv(results, church_address):
-    """Create a CSV export for the current carpool assignments."""
     rows = []
+
     for car in results["cars"]:
         driver = car["driver"]
         passengers = car["ordered_passengers"]
-        passenger_names = " | ".join(p["name"] for p in passengers) if passengers else ""
-        passenger_addresses = " | ".join(p["address"] for p in passengers) if passengers else ""
 
         rows.append(
             {
@@ -383,37 +398,50 @@ def export_results_csv(results, church_address):
                 "driver_address": driver["address"],
                 "church_address": church_address,
                 "passenger_count": len(passengers),
-                "passenger_names_in_pickup_order": passenger_names,
-                "passenger_addresses_in_pickup_order": passenger_addresses,
+                "passenger_names_in_pickup_order": " | ".join(p["name"] for p in passengers),
+                "passenger_addresses_in_pickup_order": " | ".join(p["address"] for p in passengers),
                 "seats_used": car["seats_used"],
                 "capacity": car["capacity"],
                 "estimated_distance_miles": round(car["distance_miles"], 2),
             }
         )
 
-    if results["unassigned"]:
-        for passenger in results["unassigned"]:
-            rows.append(
-                {
-                    "driver_name": "UNASSIGNED",
-                    "driver_address": "",
-                    "church_address": church_address,
-                    "passenger_count": 1,
-                    "passenger_names_in_pickup_order": passenger["name"],
-                    "passenger_addresses_in_pickup_order": passenger["address"],
-                    "seats_used": 0,
-                    "capacity": 0,
-                    "estimated_distance_miles": "",
-                }
-            )
+    for passenger in results["unassigned"]:
+        rows.append(
+            {
+                "driver_name": "UNASSIGNED",
+                "driver_address": "",
+                "church_address": church_address,
+                "passenger_count": 1,
+                "passenger_names_in_pickup_order": passenger["name"],
+                "passenger_addresses_in_pickup_order": passenger["address"],
+                "seats_used": 0,
+                "capacity": 0,
+                "estimated_distance_miles": "",
+            }
+        )
 
-    df = pd.DataFrame(rows)
-    return df.to_csv(index=False).encode("utf-8")
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
-# ---------- Display functions ----------
+# =========================================================
+# Display Helpers
+# =========================================================
+def build_people_table(people):
+    rows = []
+    for person in people:
+        rows.append(
+            {
+                "Name": person["name"],
+                "Address": person["address"],
+                "Role": "🚗 Driver" if person["has_car"] else "🧍 Passenger",
+                "Capacity": person["capacity"] if person["has_car"] else 0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def display_summary(results):
-    """Render high-level stats and individual car summary cards."""
     stats = results["stats"]
 
     st.subheader("📊 Carpool Summary")
@@ -424,12 +452,9 @@ def display_summary(results):
 
     if results["unassigned"]:
         st.warning(
-            "⚠️ Overflow warning: not enough driver seats for everyone. "
-            f"Unassigned passengers: {', '.join(p['name'] for p in results['unassigned'])}"
+            "⚠️ Not enough available seats for everyone. Unassigned passengers: "
+            + ", ".join(p["name"] for p in results["unassigned"])
         )
-
-    if not results["cars"]:
-        return
 
     st.subheader("🚗 Car Assignments")
     for idx, car in enumerate(results["cars"], start=1):
@@ -451,7 +476,6 @@ def display_summary(results):
 
 
 def build_map(church_coords, church_address, results):
-    """Build a folium map showing the church, people, and each car's route."""
     all_points = [church_coords]
     for car in results["cars"]:
         all_points.extend(car["route_points"])
@@ -461,7 +485,6 @@ def build_map(church_coords, church_address, results):
 
     trip_map = folium.Map(location=[center_lat, center_lon], zoom_start=11)
 
-    # Church marker.
     folium.Marker(
         location=list(church_coords),
         popup=f"⛪ Church<br>{church_address}",
@@ -485,9 +508,7 @@ def build_map(church_coords, church_address, results):
     for idx, car in enumerate(results["cars"]):
         color = route_colors[idx % len(route_colors)]
         driver = car["driver"]
-        passengers = car["ordered_passengers"]
 
-        # Driver marker.
         folium.Marker(
             location=list(driver["coords"]),
             popup=f"🚗 {driver['name']}<br>{driver['address']}",
@@ -495,8 +516,7 @@ def build_map(church_coords, church_address, results):
             icon=folium.Icon(color=color, icon="user"),
         ).add_to(trip_map)
 
-        # Passenger markers.
-        for passenger in passengers:
+        for passenger in car["ordered_passengers"]:
             folium.Marker(
                 location=list(passenger["coords"]),
                 popup=f"🧍 {passenger['name']}<br>{passenger['address']}",
@@ -504,7 +524,6 @@ def build_map(church_coords, church_address, results):
                 icon=folium.Icon(color="lightgray", icon="info-sign"),
             ).add_to(trip_map)
 
-        # Route polyline.
         folium.PolyLine(
             locations=[list(point) for point in car["route_points"]],
             color=color,
@@ -516,26 +535,23 @@ def build_map(church_coords, church_address, results):
     return trip_map
 
 
-# ---------- Action handlers ----------
+# =========================================================
+# Actions
+# =========================================================
 def clear_new_person_inputs():
-    """Reset the add-person inputs after a successful add."""
     st.session_state.new_person_name = ""
     st.session_state.new_person_has_car = False
     st.session_state.new_person_capacity = 3
     st.session_state.new_person_address = ""
+    st.session_state._new_person_address = ""
 
 
 def add_person(name, address, has_car, capacity):
-    """Add a person to the session-state list."""
     clean_name = name.strip()
     clean_address = address.strip()
 
     if not clean_name or not clean_address:
         st.error("Please provide both a name and a full address.")
-        return False
-
-    if has_car and capacity < 0:
-        st.error("Capacity cannot be negative.")
         return False
 
     st.session_state.person_counter += 1
@@ -554,32 +570,28 @@ def add_person(name, address, has_car, capacity):
 
 
 def remove_person(person_id):
-    """Remove a person from the session-state list."""
     st.session_state.people = [p for p in st.session_state.people if p["id"] != person_id]
     st.session_state.carpool_results = None
 
 
 def reset_all():
-    """Clear user-entered data and cached results."""
     st.session_state.church_address = ""
+    st.session_state._church_address = ""
     st.session_state.people = []
     st.session_state.carpool_results = None
-    st.session_state.warnings = []
-    st.session_state.last_error = None
-    st.session_state.last_suggestion_error = None
     st.session_state.person_counter = 0
     st.session_state.geocode_cache = {}
+    st.session_state.last_suggestion_error = None
     clear_new_person_inputs()
 
 
 def generate_carpools():
-    """Validate input, geocode addresses, run optimization, and store results."""
     church_address = st.session_state.church_address.strip()
     api_key = st.session_state.ors_api_key.strip()
     people = st.session_state.people
 
     if not api_key:
-        st.warning("Please paste your OpenRouteService API key in the sidebar before generating carpools.")
+        st.warning("Please paste your OpenRouteService API key in the sidebar.")
         return
 
     if not church_address:
@@ -596,86 +608,85 @@ def generate_carpools():
         return
 
     try:
-        with st.spinner("📍 Geocoding addresses with OpenRouteService..."):
+        with st.spinner("📍 Geocoding addresses..."):
             church_coords, enriched_people = geocode_all_addresses(church_address, people, api_key)
 
-        results = optimize_carpools(church_coords, enriched_people)
-        results["church_coords"] = church_coords
-        results["church_address"] = church_address
-        st.session_state.carpool_results = results
-        st.session_state.last_error = None
+        with st.spinner("🚗 Optimizing carpools..."):
+            results = optimize_carpools(church_coords, enriched_people)
+            results["church_coords"] = church_coords
+            results["church_address"] = church_address
+            st.session_state.carpool_results = results
+
     except requests.exceptions.RequestException as exc:
-        st.session_state.last_error = f"Network/API error while geocoding: {exc}"
-        st.error(st.session_state.last_error)
+        st.error(f"Network/API error while geocoding: {exc}")
     except ValueError as exc:
-        st.session_state.last_error = str(exc)
-        st.error(st.session_state.last_error)
+        st.error(str(exc))
     except Exception as exc:
-        st.session_state.last_error = f"Unexpected error: {exc}"
-        st.error(st.session_state.last_error)
+        st.error(f"Unexpected error: {exc}")
 
 
-# ---------- Main UI ----------
+# =========================================================
+# Main App
+# =========================================================
 def main():
+    st.set_page_config(page_title="Church Carpool Optimizer", page_icon="⛪", layout="wide")
     init_session_state()
 
     st.title("⛪ Church Carpool Optimizer")
-    st.caption(
-        "Build friendly carpools that reduce driving distance using free ORS geocoding and a greedy spatial optimizer."
-    )
+    st.caption("Automatically group your congregation into efficient carpools.")
 
-    # Sidebar for API key.
     with st.sidebar:
         st.header("🔑 OpenRouteService")
-        api_key_input = st.text_input(
+        st.session_state.ors_api_key = st.text_input(
             "Paste your ORS API key",
             value=st.session_state.ors_api_key,
             type="password",
-            help="Used only for geocoding church and home addresses.",
-        )
-        st.session_state.ors_api_key = api_key_input.strip()
-        st.markdown("Need a free key? [Sign up at OpenRouteService](https://openrouteservice.org/sign-up/)")
-        st.info("Only geocoding uses ORS. Route ordering uses Haversine math only.")
+            help="Used only for geocoding and autocomplete.",
+        ).strip()
+
+        st.markdown("[Get a free API key →](https://openrouteservice.org/sign-up/)")
+        st.info("Autocomplete and geocoding use ORS. Route ordering uses Haversine distance only.")
 
     api_key = st.session_state.ors_api_key
 
-    # Top inputs.
+    # Church input
     st.subheader("⛪ Church destination")
     render_address_autocomplete(
         label="Church address",
         key_name="church_address",
         api_key=api_key,
         placeholder="123 Main St, Springfield, IL 62701",
-        icon="⛪",
         help_text="Start typing and choose one of the suggested addresses.",
     )
 
-    # Add-person area.
+    # Add person section
     with st.container(border=True):
         st.subheader("➕ Add a congregation member")
+
         col1, col2 = st.columns([1, 2])
+
         with col1:
             st.text_input("Name", key="new_person_name", placeholder="Jane Smith")
-            st.toggle("Has a car?", key="new_person_has_car")
+            st.toggle("Has a car? 🚗", key="new_person_has_car")
             st.number_input(
-                "If yes, how many passengers can they carry?",
+                "Passenger seats",
                 min_value=0,
                 max_value=20,
                 step=1,
                 key="new_person_capacity",
                 disabled=not st.session_state.new_person_has_car,
             )
+
         with col2:
             render_address_autocomplete(
                 label="Home address",
                 key_name="new_person_address",
                 api_key=api_key,
                 placeholder="456 Oak Ave, Springfield, IL 62704",
-                icon="🏠",
-                help_text="Pick a suggested address or keep the one you typed.",
+                help_text="Suggestions appear as you type.",
             )
 
-        if st.button("Add Person", type="secondary"):
+        if st.button("➕ Add Person", use_container_width=True):
             added = add_person(
                 st.session_state.new_person_name,
                 st.session_state.new_person_address,
@@ -685,33 +696,47 @@ def main():
             if added:
                 st.rerun()
 
-    # Running list of people.
+    # People list
     st.subheader("👥 Current People")
     people = st.session_state.people
+
     if people:
         st.dataframe(build_people_table(people), use_container_width=True, hide_index=True)
+
         st.write("Remove an entry:")
-        remove_cols = st.columns(min(len(people), 4) or 1)
+        cols = st.columns(min(len(people), 4))
         for idx, person in enumerate(people):
-            with remove_cols[idx % len(remove_cols)]:
+            with cols[idx % len(cols)]:
                 if st.button(f"❌ {person['name']}", key=f"remove_{person['id']}"):
                     remove_person(person["id"])
                     st.rerun()
-    else:
-        st.info("No people added yet.")
 
-    action_col1, action_col2, action_col3 = st.columns([1, 1, 2])
+        drivers_count = sum(1 for p in people if p["has_car"])
+        passengers_count = sum(1 for p in people if not p["has_car"])
+        total_seats = sum(p["capacity"] for p in people if p["has_car"])
+
+        st.write(
+            f"🚗 Drivers: **{drivers_count}** | "
+            f"🧍 Passengers: **{passengers_count}** | "
+            f"💺 Total Seats: **{total_seats}**"
+        )
+    else:
+        st.info("Add people to get started.")
+
+    action_col1, action_col2 = st.columns(2)
     with action_col1:
         if st.button("🚗 Generate Carpools", type="primary", use_container_width=True):
             generate_carpools()
+
     with action_col2:
         if st.button("🔄 Reset", use_container_width=True):
             reset_all()
             st.rerun()
 
-    # Results section.
+    # Results
     results = st.session_state.carpool_results
     if results:
+        st.markdown("---")
         display_summary(results)
 
         st.subheader("🗺️ Pickup Map")
@@ -724,32 +749,28 @@ def main():
             data=csv_bytes,
             file_name="church_carpool_assignments.csv",
             mime="text/csv",
-            use_container_width=False,
         )
 
-        # Optional plain table view for quick scanning/export verification.
-        export_preview = []
+        preview_rows = []
         for car in results["cars"]:
-            export_preview.append(
+            preview_rows.append(
                 {
                     "Driver": car["driver"]["name"],
                     "Driver Address": car["driver"]["address"],
-                    "Passengers (ordered)": ", ".join(p["name"] for p in car["ordered_passengers"])
-                    if car["ordered_passengers"]
-                    else "",
+                    "Passengers": ", ".join(p["name"] for p in car["ordered_passengers"]) if car["ordered_passengers"] else "",
                     "Distance (miles)": round(car["distance_miles"], 2),
                     "Seats Used": f"{car['seats_used']} / {car['capacity']}",
                 }
             )
-        if export_preview:
-            st.subheader("📄 Results Table")
-            st.dataframe(pd.DataFrame(export_preview), use_container_width=True, hide_index=True)
 
-    # Helpful edge-case note.
+        if preview_rows:
+            st.subheader("📄 Results Table")
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
     if len(people) == 1:
         only_person = people[0]
         if only_person["has_car"]:
-            st.info("With one driver, the trip will simply be that person driving directly to church.")
+            st.info("With one driver, the route is just that person going directly to church.")
         else:
             st.info("With one passenger and no driver, the app will warn that no car is available.")
 
