@@ -16,6 +16,10 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 
+# Set page config before any other Streamlit UI calls
+st.set_page_config(page_title="Church Carpool Optimizer", page_icon="⛪", layout="wide")
+
+
 # =========================================================
 # Session State Initialization
 # =========================================================
@@ -23,6 +27,7 @@ def init_session_state():
     defaults = {
         "ors_api_key": "",
         "church_address": "",
+        "_church_address": "",
         "people": [],
         "geocode_cache": {},
         "carpool_results": None,
@@ -31,9 +36,10 @@ def init_session_state():
         "new_person_has_car": False,
         "new_person_capacity": 3,
         "new_person_address": "",
-        "last_suggestion_error": None,
-        "_church_address": "",
         "_new_person_address": "",
+        "last_suggestion_error": "",
+        "form_error": "",
+        "form_success": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -180,7 +186,7 @@ def load_perm_to_temp(perm_key, temp_key):
 
 
 def choose_suggestion(perm_key, temp_key, label):
-    """Safely select a suggestion without mutating the active widget key incorrectly."""
+    """Safely select a suggestion in a callback."""
     st.session_state[perm_key] = label
     st.session_state[temp_key] = label
 
@@ -195,9 +201,6 @@ def render_address_autocomplete(label, key_name, api_key, placeholder, help_text
     Uses:
       - permanent key: key_name
       - widget temp key: f"_{key_name}"
-
-    This avoids the StreamlitAPIException caused by writing to the same
-    widget session-state key after the widget is instantiated.
     """
     temp_key = f"_{key_name}"
 
@@ -219,13 +222,14 @@ def render_address_autocomplete(label, key_name, api_key, placeholder, help_text
         st.caption("Add your ORS API key in the sidebar to enable address suggestions.")
         return query
 
+    # Start suggesting from the very first typed character
     if len(query) < 1:
         st.caption("Start typing to see address suggestions.")
         return query
 
     try:
         suggestions = get_address_suggestions(query, api_key)
-        st.session_state.last_suggestion_error = None
+        st.session_state.last_suggestion_error = ""
     except requests.exceptions.RequestException:
         suggestions = []
         st.session_state.last_suggestion_error = "Address suggestions are temporarily unavailable."
@@ -539,6 +543,7 @@ def build_map(church_coords, church_address, results):
 # Actions
 # =========================================================
 def clear_new_person_inputs():
+    """Clear add-person widgets safely when called from a callback."""
     st.session_state.new_person_name = ""
     st.session_state.new_person_has_car = False
     st.session_state.new_person_capacity = 3
@@ -546,27 +551,38 @@ def clear_new_person_inputs():
     st.session_state._new_person_address = ""
 
 
-def add_person(name, address, has_car, capacity):
-    clean_name = name.strip()
-    clean_address = address.strip()
+def add_person_callback():
+    """Add a person using current widget values, then clear the widgets."""
+    name = st.session_state.new_person_name.strip()
+    address = st.session_state.new_person_address.strip()
+    has_car = st.session_state.new_person_has_car
+    capacity = int(st.session_state.new_person_capacity) if has_car else 0
 
-    if not clean_name or not clean_address:
-        st.error("Please provide both a name and a full address.")
-        return False
+    st.session_state.form_error = ""
+    st.session_state.form_success = ""
+
+    if not name or not address:
+        st.session_state.form_error = "Please provide both a name and a full address."
+        return
+
+    if has_car and capacity < 1:
+        st.session_state.form_error = "A driver must have at least 1 passenger seat."
+        return
 
     st.session_state.person_counter += 1
     st.session_state.people.append(
         {
             "id": st.session_state.person_counter,
-            "name": clean_name,
-            "address": clean_address,
+            "name": name,
+            "address": address,
             "has_car": has_car,
-            "capacity": int(capacity) if has_car else 0,
+            "capacity": capacity,
         }
     )
+
     st.session_state.carpool_results = None
     clear_new_person_inputs()
-    return True
+    st.session_state.form_success = f"Added {name}."
 
 
 def remove_person(person_id):
@@ -575,13 +591,16 @@ def remove_person(person_id):
 
 
 def reset_all():
+    """Reset the whole app safely when called from a callback."""
     st.session_state.church_address = ""
     st.session_state._church_address = ""
     st.session_state.people = []
     st.session_state.carpool_results = None
     st.session_state.person_counter = 0
     st.session_state.geocode_cache = {}
-    st.session_state.last_suggestion_error = None
+    st.session_state.last_suggestion_error = ""
+    st.session_state.form_error = ""
+    st.session_state.form_success = ""
     clear_new_person_inputs()
 
 
@@ -629,7 +648,6 @@ def generate_carpools():
 # Main App
 # =========================================================
 def main():
-    st.set_page_config(page_title="Church Carpool Optimizer", page_icon="⛪", layout="wide")
     init_session_state()
 
     st.title("⛪ Church Carpool Optimizer")
@@ -637,13 +655,12 @@ def main():
 
     with st.sidebar:
         st.header("🔑 OpenRouteService")
-        st.session_state.ors_api_key = st.text_input(
+        st.text_input(
             "Paste your ORS API key",
-            value=st.session_state.ors_api_key,
+            key="ors_api_key",
             type="password",
             help="Used only for geocoding and autocomplete.",
-        ).strip()
-
+        )
         st.markdown("[Get a free API key →](https://openrouteservice.org/sign-up/)")
         st.info("Autocomplete and geocoding use ORS. Route ordering uses Haversine distance only.")
 
@@ -670,7 +687,7 @@ def main():
             st.toggle("Has a car? 🚗", key="new_person_has_car")
             st.number_input(
                 "Passenger seats",
-                min_value=0,
+                min_value=1,
                 max_value=20,
                 step=1,
                 key="new_person_capacity",
@@ -686,15 +703,13 @@ def main():
                 help_text="Suggestions appear as you type.",
             )
 
-        if st.button("➕ Add Person", use_container_width=True):
-            added = add_person(
-                st.session_state.new_person_name,
-                st.session_state.new_person_address,
-                st.session_state.new_person_has_car,
-                st.session_state.new_person_capacity,
-            )
-            if added:
-                st.rerun()
+        st.button("➕ Add Person", use_container_width=True, on_click=add_person_callback)
+
+        if st.session_state.form_error:
+            st.error(st.session_state.form_error)
+
+        if st.session_state.form_success:
+            st.success(st.session_state.form_success)
 
     # People list
     st.subheader("👥 Current People")
@@ -729,9 +744,7 @@ def main():
             generate_carpools()
 
     with action_col2:
-        if st.button("🔄 Reset", use_container_width=True):
-            reset_all()
-            st.rerun()
+        st.button("🔄 Reset", use_container_width=True, on_click=reset_all)
 
     # Results
     results = st.session_state.carpool_results
@@ -757,7 +770,8 @@ def main():
                 {
                     "Driver": car["driver"]["name"],
                     "Driver Address": car["driver"]["address"],
-                    "Passengers": ", ".join(p["name"] for p in car["ordered_passengers"]) if car["ordered_passengers"] else "",
+                    "Passengers": ", ".join(p["name"] for p in car["ordered_passengers"])
+                    if car["ordered_passengers"] else "",
                     "Distance (miles)": round(car["distance_miles"], 2),
                     "Seats Used": f"{car['seats_used']} / {car['capacity']}",
                 }
